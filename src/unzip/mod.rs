@@ -14,7 +14,7 @@ mod seekable_http_reader;
 use std::{
     borrow::Cow,
     fs::File,
-    io::{ErrorKind, Read, Seek},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -27,13 +27,19 @@ use crate::unzip::{
     cloneable_seekable_reader::CloneableSeekableReader, progress_updater::ProgressUpdater,
 };
 
-use self::{
-    cloneable_seekable_reader::HasLength,
-    seekable_http_reader::{AccessPattern, SeekableHttpReader, SeekableHttpReaderEngine},
-};
+use self::seekable_http_reader::{AccessPattern, SeekableHttpReader, SeekableHttpReaderEngine};
+
+pub(crate) fn determine_stream_len<R: Seek>(stream: &mut R) -> std::io::Result<u64> {
+    let old_pos = stream.stream_position()?;
+    let len = stream.seek(SeekFrom::End(0))?;
+    if old_pos != len {
+        stream.seek(SeekFrom::Start(old_pos))?;
+    }
+    Ok(len)
+}
 
 /// Options for unzipping.
-pub struct UnzipOptions {
+pub struct UnzipOptions<'a, 'b> {
     /// The destination directory.
     pub output_directory: Option<PathBuf>,
     /// Password if encrypted.
@@ -41,9 +47,9 @@ pub struct UnzipOptions {
     /// Whether to run in single-threaded mode.
     pub single_threaded: bool,
     /// A filename filter, optionally
-    pub filename_filter: Option<Box<dyn FilenameFilter + Sync>>,
+    pub filename_filter: Option<Box<dyn FilenameFilter + Sync + 'a>>,
     /// An object to receive notifications of unzip progress.
-    pub progress_reporter: Box<dyn UnzipProgressReporter + Sync>,
+    pub progress_reporter: Box<dyn UnzipProgressReporter + Sync + 'b>,
 }
 
 /// A trait of types which wish to hear progress updates on the unzip.
@@ -161,11 +167,11 @@ impl<F: Fn()> UnzipEngineImpl for UnzipUriEngine<F> {
 
 impl UnzipEngine {
     /// Create an unzip engine which knows how to unzip a file.
-    pub fn for_file(zipfile: File) -> Result<Self> {
+    pub fn for_file(mut zipfile: File) -> Result<Self> {
         // The following line doesn't actually seem to make any significant
         // performance difference.
         // let zipfile = BufReader::new(zipfile);
-        let compressed_length = zipfile.len();
+        let compressed_length = determine_stream_len(&mut zipfile)?;
         let zipfile = CloneableSeekableReader::new(zipfile);
         Ok(Self {
             zipfile: Box::new(UnzipFileEngine(ZipArchive::new(zipfile)?)),
@@ -211,7 +217,7 @@ impl UnzipEngine {
                     let mut response = reqwest::blocking::get(uri)?;
                     let mut tempfile = tempfile::tempfile()?;
                     std::io::copy(&mut response, &mut tempfile)?;
-                    let compressed_length = tempfile.len();
+                    let compressed_length = determine_stream_len(&mut tempfile)?;
                     let zipfile = CloneableSeekableReader::new(tempfile);
                     (
                         compressed_length,
@@ -343,15 +349,10 @@ fn unzip_serial_or_parallel<'a, T: Read + Seek + 'a>(
                 .into_iter()
                 .map(|name| {
                     let myzip: &mut zip::ZipArchive<T> = &mut get_ziparchive_clone();
-                    let file: ZipFile;
-                    match &options.password {
-                        None => {
-                            file = myzip.by_name(&name)?;
-                        }
-                        Some(string) => {
-                            file = myzip.by_name_decrypt(&name, string.as_bytes())??;
-                        }
-                    }
+                    let file: ZipFile = match &options.password {
+                        None => myzip.by_name(&name)?,
+                        Some(string) => myzip.by_name_decrypt(&name, string.as_bytes())?,
+                    };
                     let r = extract_file(
                         file,
                         &options.output_directory,
@@ -376,18 +377,11 @@ fn extract_file_by_index<'a, T: Read + Seek + 'a>(
     directory_creator: &DirectoryCreator,
 ) -> Result<(), anyhow::Error> {
     let myzip: &mut zip::ZipArchive<T> = &mut get_ziparchive_clone();
-    let file: ZipFile;
-    match password {
-        None => {
-            file = myzip.by_index(i)?;
-            extract_file(file, output_directory, progress_reporter, directory_creator)
-
-        }
-        Some(string) => {
-            file = myzip.by_index_decrypt(i, string.as_bytes())??;
-            extract_file(file, output_directory, progress_reporter, directory_creator)
-        }
-    }
+    let file: ZipFile = match password {
+        None => myzip.by_index(i)?,
+        Some(string) => myzip.by_index_decrypt(i, string.as_bytes())?,
+    };
+    extract_file(file, output_directory, progress_reporter, directory_creator)
 }
 
 fn extract_file(
@@ -398,6 +392,7 @@ fn extract_file(
 ) -> Result<(), anyhow::Error> {
     let name = file
         .enclosed_name()
+        .as_deref()
         .map(Path::to_string_lossy)
         .unwrap_or_else(|| Cow::Borrowed("<unprintable>"))
         .to_string();
@@ -415,11 +410,11 @@ fn extract_file_inner(
     let name = file
         .enclosed_name()
         .ok_or_else(|| std::io::Error::new(ErrorKind::Unsupported, "path not safe to extract"))?;
+    let display_name = name.display().to_string();
     let out_path = match output_directory {
         Some(output_directory) => output_directory.join(name),
-        None => PathBuf::from(name),
+        None => name,
     };
-    let display_name = name.display().to_string();
     progress_reporter.extraction_starting(&display_name);
     log::debug!(
         "Start extract of file at {:x}, length {:x}, name {}",
@@ -497,6 +492,10 @@ impl DirectoryCreator {
 
 #[cfg(test)]
 mod tests {
+    use super::FilenameFilter;
+    use crate::{NullProgressReporter, UnzipEngine, UnzipOptions};
+    use httptest::Server;
+    use ripunzip_test_utils::*;
     use std::{
         collections::HashSet,
         env::{current_dir, set_current_dir},
@@ -504,13 +503,10 @@ mod tests {
         io::{Cursor, Seek, Write},
         path::Path,
     };
-    use std::path::PathBuf;
     use tempfile::tempdir;
     use test_log::test;
+    use zip::{unstable::write::FileOptionsExt, write::ExtendedFileOptions};
     use zip::{write::FileOptions, ZipWriter};
-
-    use crate::{NullProgressReporter, UnzipEngine, UnzipOptions};
-    use ripunzip_test_utils::*;
 
     struct UnzipSomeFilter;
     impl FilenameFilter for UnzipSomeFilter {
@@ -530,21 +526,38 @@ mod tests {
 
     fn create_zip_file(path: &Path, include_a_txt: bool) {
         let file = File::create(path).unwrap();
-        create_zip(file, include_a_txt)
+        create_zip(file, include_a_txt, None)
     }
 
-    fn create_zip(w: impl Write + Seek, include_a_txt: bool) {
-        let mut zip = ZipWriter::new(w);
-
-        zip.add_directory("test/", Default::default()).unwrap();
+    fn create_encrypted_zip_file(path: &Path, include_a_txt: bool) {
+        let file = File::create(path).unwrap();
         let options = FileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
-            .unix_permissions(0o755);
+            .unix_permissions(0o755)
+            .with_deprecated_encryption("1Password".as_ref());
+        create_zip(file, include_a_txt, Some(options))
+    }
+
+    fn create_zip(
+        w: impl Write + Seek,
+        include_a_txt: bool,
+        custom_options: Option<FileOptions<ExtendedFileOptions>>,
+    ) {
+        let mut zip = ZipWriter::new(w);
+        let options = custom_options.unwrap_or_else(|| {
+            FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o755)
+        });
+
+        zip.add_directory::<_, ExtendedFileOptions>("test/", Default::default())
+            .unwrap();
+
         if include_a_txt {
-            zip.start_file("test/a.txt", options).unwrap();
+            zip.start_file("test/a.txt", options.clone()).unwrap();
             zip.write_all(b"Contents of A\n").unwrap();
         }
-        zip.start_file("b.txt", options).unwrap();
+        zip.start_file("b.txt", options.clone()).unwrap();
         zip.write_all(b"Contents of B\n").unwrap();
         zip.start_file("test/c.txt", options).unwrap();
         zip.write_all(b"Contents of C\n").unwrap();
@@ -608,11 +621,11 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_with_path_with_password() {
+    fn test_extract_encrypted_with_path() {
         run_with_and_without_a_filename_filter(|create_a, filename_filter| {
             let td = tempdir().unwrap();
-            let mut zf = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            zf.push("test_resources/z_with_password.zip");
+            let zf = td.path().join("z.zip");
+            create_encrypted_zip_file(&zf, create_a);
             let zf = File::open(zf).unwrap();
             let outdir = td.path().join("outdir");
             let options = UnzipOptions {
@@ -643,16 +656,12 @@ mod tests {
         )
     }
 
-    use httptest::Server;
-
-    use super::FilenameFilter;
-
     #[test]
     fn test_extract_from_server() {
         run_with_and_without_a_filename_filter(|create_a, filename_filter| {
             let td = tempdir().unwrap();
             let mut zip_data = Cursor::new(Vec::new());
-            create_zip(&mut zip_data, create_a);
+            create_zip(&mut zip_data, create_a, None);
             let body = zip_data.into_inner();
             println!("Whole zip:");
             hexdump::hexdump(&body);
